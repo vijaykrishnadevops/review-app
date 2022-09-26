@@ -1,0 +1,91 @@
+pipeline {
+    agent any
+    environment {
+        PR_STATUS = sh(script: '''echo ${payload} | jq ".action"''', returnStdout: true).trim()
+        PR_NUMBER = sh(script: '''echo ${payload} | jq ".number"''', returnStdout: true).trim()
+        PR_BRANCH = sh(script: '''echo ${payload} | jq ".pull_request.head.ref"''', returnStdout: true).trim()
+        GCP_PROJECT_ID= "GCP_PROJECT_ID"
+        APP_NAME= "review-app"
+        GCP_ZONE = "us-east1-b"
+        GKE_CLUSTER_NAME = "gke-cluster"
+    }
+    stages {
+        stage ('Main Stage') {
+            steps { 
+                script {
+                    if (PR_STATUS.contains("opened") || PR_STATUS.contains("reopened") || PR_STATUS.contains("synchronize") ) {
+                        stage("Checkout code") {
+                            script {
+                                sh 'git checkout -b ${PR_BRANCH}'
+                            }
+                        }
+                        stage("Build image") {
+                            script {
+                                sh '''
+                                cd sample-app/
+                                docker build . -t gcr.io/${GCP_PROJECT_ID}/${APP_NAME}:${GIT_COMMIT}
+                                '''
+                            }
+                        }
+                        stage("Push image") {
+                            script {
+                                sh "gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin gcr.io"
+                                sh "docker push gcr.io/${GCP_PROJECT_ID}/${APP_NAME}:${GIT_COMMIT}"
+                            }
+                        }
+                        stage('Generate Manifest') {
+                            script {
+                                sh """
+                                envsubst < sample-app/yamls/review.yaml > sample-app/yamls/patched-config.yaml
+                                """
+                            }
+                        }
+                        stage('Authenticate GKE cluster') {
+                            script {
+                                    sh '''
+                                    envsubst < sample-app/yamls/review.yaml > sample-app/yamls/patched-config.yaml
+                                    gcloud container clusters get-credentials ${GKE_CLUSTER_NAME} --zone ${GCP_ZONE} --project ${GCP_PROJECT_ID}
+                                    cd sample-app/
+                                    kubectl apply -f yamls/patched-config.yaml
+                                    '''
+                            }
+                        }
+                        stage('Deploy review application') {
+                            script {
+                                sh '''
+                                cd sample-app/
+                                kubectl apply -f yamls/patched-config.yaml
+                                kubectl rollout status deployment/${APP_NAME}-${PR_NUMBER}-deployment -n ${APP_NAME}-${PR_NUMBER}-ns
+                                '''
+                            }
+                        }
+
+                    }
+
+                    if (PR_STATUS.contains("closed")) {
+                        stage('Authenticate GKE cluster') {
+                            script {
+                                    sh '''
+                                    envsubst < sample-app/yamls/review.yaml > sample-app/yamls/patched-config.yaml
+                                    gcloud container clusters get-credentials ${GKE_CLUSTER_NAME} --zone ${GCP_ZONE} --project ${GCP_PROJECT_ID}
+                                    cd sample-app/
+                                    kubectl apply -f yamls/patched-config.yaml
+                                    '''
+                            }
+                        }
+                        stage("Delete review application") {
+                            script {
+                                sh "kubectl delete namespace ${APP_NAME}-${PR_NUMBER}-ns"
+                            }
+                        }
+                    }   
+                }
+            }
+        }
+    }
+    post {
+        always {
+            deleteDir() /* clean up our workspace */
+        }
+    }    
+}
